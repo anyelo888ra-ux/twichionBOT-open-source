@@ -36,9 +36,11 @@ cd twichionBOT-open-source
 Crea un archivo `requirements.txt` con el siguiente contenido:
 
 ```text
-requests
+requests==2.31.0
+aiohttp==3.9.3
+websockets==12.0
 curl_cffi>=0.7.0
-kickpython
+kickpython==0.1.5
 
 ```
 
