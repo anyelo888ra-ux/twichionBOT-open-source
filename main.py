@@ -1,202 +1,362 @@
+
+"""
+twichionBOT - Open Source Twitch AI Bot
+Copyright (c) twichionBOT contributors
+
+Configuration is provided through environment variables.
+Never put API keys or Twitch tokens directly in this file.
+"""
+
 import os
+import re
+import time
 import socket
-import requests
 import threading
-import asyncio
-from http.server import HTTPServer, BaseHTTPRequestHandler
-# Importación correcta de la librería kickpython
-from kickpython import KickAPI
+import logging
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# === CONFIGURACIÓN GENERAL ===
-GROQ_API_KEY = os.environ.get('GROQ_API_KEY', 'gsk_123456789wty015-ejemplo-quita-esto-y-pon-tu-api-key-para-la-ia')
-# Endpoint oficial unificado para Groq
-GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions'
+from groq import Groq
 
-# --- CONFIGURACIÓN TWITCH ---
-SERVER_TWITCH = 'irc.chat.twitch.tv'
-PORT_TWITCH = 6667
-TOKEN_TWITCH = os.environ.get('TWITCH_TOKEN', 'oauth:123456789wty015-ejemplo-quita-esto-y-pon-tu-oauth-de-tu-cuenta-del-bot')
-NICKNAME_TWITCH = 'twichionbot'
-# Canales en formato lista/tupla para conectar
-CHANNELS_TWITCH = ['#c00lkidd_v2ytofficial', '#twichionbot']
 
-# --- CONFIGURACIÓN KICK ---
-# Si en Render pones KICK_STREAMER = c00lkidd-v2yt,twichionbot
-KICK_STREAMER_RAW = os.environ.get('KICK_STREAMERS', 'c00lkidd-v2yt')
-KICK_STREAMERS = [s.strip() for s in KICK_STREAMER_RAW.split(',')]
-KICK_TOKEN = os.environ.get('KICK_TOKEN', os.environ.get('kick_session', '123456789wty015-ejemplo-quita-esto-y-pon-tu-kick-session-de-tu-cuenta-del-bot'))
-KICK_CLIENT_ID = os.environ.get('KICK_CLIENT_ID', 'esto-puede-ser-incesario-asique-no-importa')  
+# =========================================================
+# CONFIGURATION
+# =========================================================
 
-# --- SERVIDOR WEB PARA RENDER ---
+BOT_NAME = os.getenv("BOT_NAME", "twichionBOT").strip()
+BOT_NICK = os.getenv("TWITCH_BOT_NICK", "twichionbot").strip().lower()
+
+TWITCH_TOKEN = os.getenv("TWITCH_TOKEN", "").strip()
+TWITCH_CHANNELS = [
+    channel.strip().lstrip("#").lower()
+    for channel in os.getenv("TWITCH_CHANNELS", "").split(",")
+    if channel.strip()
+]
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
+
+BOT_PREFIX = os.getenv("BOT_PREFIX", "!ask").strip()
+
+SYSTEM_PROMPT = os.getenv(
+    "SYSTEM_PROMPT",
+    "You are a friendly and helpful Twitch chat assistant. "
+    "Answer briefly, clearly, and in the language used by the viewer."
+)
+
+PORT = int(os.getenv("PORT", "10000"))
+
+IRC_HOST = "irc.chat.twitch.tv"
+IRC_PORT = 6667
+
+MAX_MESSAGE_LENGTH = 450
+REQUEST_COOLDOWN = 3
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [%(levelname)s] %(message)s"
+)
+
+logger = logging.getLogger("twichionBOT")
+
+
+# =========================================================
+# AI ENGINE
+# =========================================================
+
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+def ask_ai(prompt):
+    if not groq_client:
+        return "La IA no está configurada. Contacta al administrador."
+
+    try:
+        response = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt}
+            ],
+            max_completion_tokens=250,
+            temperature=0.7
+        )
+
+        answer = response.choices[0].message.content or ""
+        answer = re.sub(r"\s+", " ", answer).strip()
+
+        return answer[:MAX_MESSAGE_LENGTH] or "No pude generar una respuesta."
+
+    except Exception:
+        logger.exception("Error al consultar Groq")
+        return "La IA tuvo un problema al responder."
+
+
+# =========================================================
+# TWITCH IRC
+# =========================================================
+
+class TwitchBot:
+
+    def __init__(self):
+        self.connection = None
+        self.running = True
+        self.last_request = {}
+
+    def send_message(self, channel, message):
+        if not self.connection:
+            return
+
+        message = re.sub(r"[\r\n]+", " ", message).strip()
+        message = message[:MAX_MESSAGE_LENGTH]
+
+        if not message:
+            return
+
+        payload = f"PRIVMSG #{channel} :{message}\r\n"
+
+        try:
+            self.connection.send(payload.encode("utf-8"))
+        except OSError:
+            logger.warning("No se pudo enviar el mensaje a #%s", channel)
+
+    def connect(self):
+        if not TWITCH_TOKEN or not TWITCH_CHANNELS:
+            logger.error(
+                "Configura TWITCH_TOKEN y TWITCH_CHANNELS para activar Twitch."
+            )
+            return False
+
+        try:
+            self.connection = socket.socket()
+            self.connection.settimeout(1)
+            self.connection.connect((IRC_HOST, IRC_PORT))
+
+            self.connection.send(
+                f"PASS {TWITCH_TOKEN}\r\n".encode("utf-8")
+            )
+            self.connection.send(
+                f"NICK {BOT_NICK}\r\n".encode("utf-8")
+            )
+            self.connection.send(
+                b"CAP REQ :twitch.tv/tags twitch.tv/commands\r\n"
+            )
+
+            for channel in TWITCH_CHANNELS:
+                self.connection.send(
+                    f"JOIN #{channel}\r\n".encode("utf-8")
+                )
+
+            logger.info("Conectado a Twitch IRC.")
+            return True
+
+        except OSError:
+            logger.exception("No se pudo conectar a Twitch.")
+            self.disconnect()
+            return False
+
+    def disconnect(self):
+        if self.connection:
+            try:
+                self.connection.close()
+            except OSError:
+                pass
+
+        self.connection = None
+
+    def handle_message(self, raw):
+        if raw.startswith("PING"):
+            self.connection.send(b"PONG :tmi.twitch.tv\r\n")
+            return
+
+        if " PRIVMSG " not in raw:
+            return
+
+        try:
+            prefix, content = raw.split(" PRIVMSG ", 1)
+            channel, message = content.split(" :", 1)
+
+            channel = channel.lstrip("#").lower()
+            username = prefix.split("!", 1)[0].lstrip(":")
+
+            if username.lower() == BOT_NICK:
+                return
+
+            if not message.lower().startswith(BOT_PREFIX.lower() + " "):
+                return
+
+            prompt = message[len(BOT_PREFIX):].strip()
+
+            if not prompt:
+                self.send_message(
+                    channel,
+                    f"Usa {BOT_PREFIX} seguido de tu pregunta."
+                )
+                return
+
+            now = time.time()
+            previous = self.last_request.get(channel, 0)
+
+            if now - previous < REQUEST_COOLDOWN:
+                return
+
+            self.last_request[channel] = now
+
+            logger.info(
+                "Pregunta recibida en #%s de %s",
+                channel,
+                username
+            )
+
+            answer = ask_ai(prompt)
+            self.send_message(channel, f"@{username} {answer}")
+
+        except (ValueError, IndexError):
+            logger.warning("Mensaje IRC no reconocido.")
+
+    def run(self):
+        while self.running:
+            if not self.connection:
+                if not self.connect():
+                    time.sleep(10)
+                    continue
+
+            try:
+                data = self.connection.recv(4096)
+
+                if not data:
+                    raise ConnectionError("Twitch cerró la conexión")
+
+                for line in data.decode(
+                    "utf-8", errors="ignore"
+                ).split("\r\n"):
+                    if line:
+                        self.handle_message(line)
+
+            except socket.timeout:
+                continue
+
+            except (OSError, ConnectionError):
+                logger.warning("Conexión Twitch perdida. Reconectando...")
+                self.disconnect()
+                time.sleep(5)
+
+
+# =========================================================
+# WEB SERVER FOR RENDER
+# =========================================================
+
 class SimpleHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
+
+    def respond(self, content, content_type):
+        encoded = content.encode("utf-8")
+
         self.send_response(200)
-        self.send_header("Content-type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
+
+        if self.command != "HEAD":
+            self.wfile.write(encoded)
+
+    def do_HEAD(self):
+        self.respond("", "text/plain; charset=utf-8")
+
+    def do_GET(self):
+
+        if self.path == "/health":
+            return self.respond(
+                '{"status":"online","bot":"twichionBOT"}',
+                "application/json; charset=utf-8"
+            )
+
+        channels_html = (
+            ", ".join(f"#{channel}" for channel in TWITCH_CHANNELS)
+            or "No configurados"
+        )
+
         html = f"""
         <!DOCTYPE html>
-        <html>
+        <html lang="es">
         <head>
-            <title>twichionBOT Multi-Stream Status</title>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>{BOT_NAME} - Status</title>
             <style>
-                body {{ background: #0f172a; color: #38bdf8; font-family: monospace; text-align: center; padding-top: 50px; }}
-                .card {{ background: #1e293b; border: 2px solid #a855f7; display: inline-block; padding: 30px; border-radius: 12px; box-shadow: 0 0 20px rgba(168, 85, 247, 0.2); }}
-                h1 {{ margin-top: 0; color: #f43f5e; }}
-                .status {{ color: #4ade80; font-weight: bold; }}
-                .platform {{ margin: 10px 0; font-size: 16px; }}
+                body {{
+                    background: #0f172a;
+                    color: #e2e8f0;
+                    font-family: monospace;
+                    text-align: center;
+                    padding: 50px 15px;
+                }}
+                .card {{
+                    background: #1e293b;
+                    border: 2px solid #a855f7;
+                    display: inline-block;
+                    padding: 30px;
+                    border-radius: 12px;
+                    max-width: 500px;
+                }}
+                h1 {{ color: #c084fc; }}
+                .online {{ color: #4ade80; }}
+                .muted {{ color: #94a3b8; }}
             </style>
         </head>
         <body>
             <div class="card">
-                <h1>🤖 twichionBOT v3.0 (Dual Core)</h1>
-                <p>Estado del sistema: <span class="status">ONLINE &amp; MULTI-CONECTADO</span></p>
-                <div class="platform">💜 Twitch: <b>{', '.join(CHANNELS_TWITCH)}</b></div>
-                <<div class="platform">💚 Kick: <b>#{', '.join(KICK_STREAMERS)}</b></div>
-                <p style="font-size: 12px; color: #94a3b8; margin-top: 20px;">Corriendo en paralelo en la nube de Render 🚀</p>
+                <h1>🤖 {BOT_NAME}</h1>
+                <p class="online">● WEB SERVER ONLINE</p>
+                <p>Twitch channels: {channels_html}</p>
+                <p>AI model: {GROQ_MODEL}</p>
+                <p class="muted">Open Source Twitch AI Bot</p>
+                <p class="muted">Powered by Render + Groq</p>
             </div>
         </body>
         </html>
         """
-        self.wfile.write(html.encode('utf-8'))
 
-def iniciar_servidor_web():
-    port_web = int(os.environ.get('PORT', 10000))
-    server = HTTPServer(('0.0.0.0', port_web), SimpleHandler)
-    print(f"[Web] Servidor de estado corriendo en el puerto {port_web}")
+        self.respond(html, "text/html; charset=utf-8")
+
+    def log_message(self, format, *args):
+        logger.info("HTTP: " + format, *args)
+
+
+def start_web_server():
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", PORT),
+        SimpleHandler
+    )
+
+    logger.info("Web server listening on port %s", PORT)
     server.serve_forever()
 
-# --- LÓGICA UNIFICADA DE IA (GROQ) ---
-def consultar_ia_groq(prompt_usuario, autor, plataforma):
+
+# =========================================================
+# START APPLICATION
+# =========================================================
+
+def main():
+    logger.info("Starting %s...", BOT_NAME)
+
+    web_thread = threading.Thread(
+        target=start_web_server,
+        daemon=True
+    )
+    web_thread.start()
+
     if not GROQ_API_KEY:
-        return "¡Ey! Falta configurar la API key de Groq, crack."
-    
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        "model": "lama3-70b-8192",
-        "messages": [
-            {
-                "role": "system",
-                "content": f"Eres twichionBOT, un bot amigable que asiste en {plataforma}. Responde en español, de forma muy concisa y directa (máximo 1 o 2 oraciones)."
-            },
-            {
-                "role": "user",
-                "content": f"{autor} dice: {prompt_usuario}"
-            }
-        ],
-        "max_tokens": 100,
-        "temperature": 0.7
-    }
-    
+        logger.warning("GROQ_API_KEY no configurada. La IA no responderá.")
+
+    bot = TwitchBot()
+
     try:
-        response = requests.post(GROQ_URL, json=payload, headers=headers, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            return data['choices'][0]['message']['content'].strip().replace('\n', ' ')
-        else:
-            # Esto imprimirá el error exacto en tu consola de Render o VS Code si vuelve a fallar
-            print(f"[Groq Error Detalle]: {response.text}")
-            return f"¡Vaya! Groq rechazó la petición (Código {response.status_code})."
-    except Exception as e:
-        print(f"[Groq Exception] {e}")
-        return "Error procesando mi pensamiento artificial. 🧠💤"
-        
-# --- PROCESADOR DE COMANDOS COMÚN ---
-def procesar_comandos(mensaje_completo, autor, plataforma):
-    msg_lower = mensaje_completo.lower()
-    
-    if msg_lower == '!hola':
-        return f"¡Hola @{autor}! Bienvenido al directo. Escribe !comandos para ver qué más puedo hacer. 🚀"
-    elif msg_lower == '!discord':
-        return f"@{autor} ¡Únete a nuestra comunidad y prueba la Actividad de Twitchion en Discord! 🎮✨"
-    elif msg_lower == '!redes':
-        return f"@{autor} Sigue nuestros canales y apoya el código libre! 🔥"
-    elif msg_lower in ['!proyecto', '!twitchion']:
-        return f"@{autor} Twitchion es la plataforma web de streaming descentralizada y optimizada para Discord. 💻🚀"
-    elif msg_lower == '!comandos':
-        return f"@{autor} Comandos: !hola, !discord, !redes, !proyecto, !github | O mencióname con @twichionBOT [tu pregunta] para hablar con mi IA. 🤖"
-    elif msg_lower == '!github':
-        return f"@{autor} Revisa los repositorios open-source de la comunidad en GitHub. ¡Todo hecho a puro código! 🛠️"
-    elif '@twichionbot' in msg_lower:
-        prompt_limpio = mensaje_completo.replace('@twichionbot', '').replace('@twichionBOT', '').strip()
-        if prompt_limpio:
-            print(f"[{plataforma}] Consultando Groq para {autor}...")
-            return f"@{autor} {consultar_ia_groq(prompt_limpio, autor, plataforma)}"
-        return f"@{autor} ¡Dime algo después de mencionarme para poder responderte con mi IA! 🤖"
-    
-    return None
+        bot.run()
+    except KeyboardInterrupt:
+        logger.info("Apagando bot...")
+    finally:
+        bot.running = False
+        bot.disconnect()
 
-# --- BUCLE DE TWITCH (HILO 1) ---
-def iniciar_bot_twitch():
-    sock = socket.socket()
-    try:
-        sock.connect((SERVER_TWITCH, PORT_TWITCH))
-        sock.send(f"PASS {TOKEN_TWITCH}\r\n".encode('utf-8'))
-        sock.send(f"NICK {NICKNAME_TWITCH}\r\n".encode('utf-8'))
-        
-        # Unirse a múltiples canales separados por comas
-        canales_join = ",".join(CHANNELS_TWITCH)
-        sock.send(f"JOIN {canales_join}\r\n".encode('utf-8'))
-        print(f"[Twitch] Conectado exitosamente a {CHANNELS_TWITCH}")
-        
-        while True:
-            response = sock.recv(2048).decode('utf-8', errors='ignore')
-            if response.startswith('PING'):
-                sock.send("PONG :tmi.twitch.tv\r\n".encode('utf-8'))
-                continue
-                
-            if "PRIVMSG" in response:
-                partes = response.split('!')
-                autor = partes[0][1:]
-                
-                # Parseo seguro del canal de origen y el mensaje
-                partes_msg = response.split('PRIVMSG ')
-                canal_origen = partes_msg[1].split(' :', 1)[0].strip()
-                mensaje_completo = partes_msg[1].split(' :', 1)[1].strip()
-                
-                respuesta = procesar_comandos(mensaje_completo, autor, "Twitch")
-                if respuesta:
-                    # Responder específicamente al canal donde se escribió el mensaje
-                    sock.send(f"PRIVMSG {canal_origen} :{respuesta}\r\n".encode('utf-8'))
-    except Exception as e:
-        print(f"[Twitch Error] {e}")
 
-# --- BUCLE DE KICK (HILO 2) ---
-async def bucle_kick():
-    # Inicialización usando las variables de Kick
-    kick_client = KickAPI(client_id=KICK_CLIENT_ID, token=KICK_TOKEN)
-    
-    @kick_client.on_message
-    async def on_message(chat_message):
-        if chat_message.sender.username.lower() == NICKNAME_TWITCH.lower():
-            return
-            
-        autor = chat_message.sender.username
-        texto_mensaje = chat_message.content
-        
-        respuesta = procesar_comandos(texto_mensaje, autor, "Kick")
-        if respuesta:
-            await kick_client.send_message(chat_message.chatroom_id, respuesta)
-
-    for streamer in KICK_STREAMERS:
-        print(f"[Kick] Conectando de forma segura al canal de {streamer}...")
-    await kick_client.start(KICK_STREAMERS)
-
-def iniciar_bot_kick():
-    asyncio.run(bucle_kick())
-
-# --- ORQUESTADOR PRINCIPAL ---
-if __name__ == '__main__':
-    # 1. Hilo del Servidor Web (Render)
-    hilo_web = threading.Thread(target=iniciar_servidor_web, daemon=True)
-    hilo_web.start()
-
-    # 2. Hilo de Kick
-    hilo_kick = threading.Thread(target=iniciar_bot_kick, daemon=True)
-    hilo_kick.start()
-
-    # 3. Hilo Principal: Twitch
-    iniciar_bot_twitch()
+if __name__ == "__main__":
+    main()
